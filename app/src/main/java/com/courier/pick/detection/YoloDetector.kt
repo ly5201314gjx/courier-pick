@@ -81,12 +81,23 @@ class YoloDetector(private val context: Context) {
         loadIfNeeded()
         val env = env ?: return emptyList()
         val session = session ?: return emptyList()
-        val w = softBitmap.width
-        val h = softBitmap.height
+        // Pre-downscale huge bitmaps (e.g. static photos) so we never allocate
+        // multi-megapixel pixel arrays; YOLO works on a letterboxed 640px anyway.
+        val src = if (maxOf(softBitmap.width, softBitmap.height) > 1280) {
+            val s = 1280f / maxOf(softBitmap.width, softBitmap.height)
+            Bitmap.createScaledBitmap(
+                softBitmap,
+                (softBitmap.width * s).toInt().coerceAtLeast(1),
+                (softBitmap.height * s).toInt().coerceAtLeast(1),
+                true
+            )
+        } else softBitmap
+        val w = src.width
+        val h = src.height
         val total = w * h
         if (pixels == null || pixels!!.size < total) pixels = IntArray(total)
         val px = pixels!!
-        softBitmap.getPixels(px, 0, w, 0, 0, w, h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
 
         // --- letterbox to 640x640 ---
         val scale = INPUT_SIZE.toFloat() / maxOf(w, h)
@@ -96,7 +107,8 @@ class YoloDetector(private val context: Context) {
         val padY = ((INPUT_SIZE - newH) / 2f)
 
         val fb = floatBuf
-        var idx = 0
+        // NCHW layout: [3, 640, 640] with RGB channel planes (model expects channel-first).
+        val plane = INPUT_SIZE * INPUT_SIZE
         for (y in 0 until INPUT_SIZE) {
             val fy = y - padY
             val sy = (fy / scale).toInt()
@@ -104,15 +116,18 @@ class YoloDetector(private val context: Context) {
             for (x in 0 until INPUT_SIZE) {
                 val fx = x - padX
                 val sx = (fx / scale).toInt()
+                val base = y * INPUT_SIZE + x
                 if (rowOk && fx >= 0 && sx in 0 until w) {
                     val c = px[sy * w + sx]
-                    fb[idx] = ((c shr 16) and 0xFF) / 255f
-                    fb[idx + 1] = ((c shr 8) and 0xFF) / 255f
-                    fb[idx + 2] = (c and 0xFF) / 255f
+                    fb[base] = ((c shr 16) and 0xFF) / 255f
+                    fb[plane + base] = ((c shr 8) and 0xFF) / 255f
+                    fb[2 * plane + base] = (c and 0xFF) / 255f
                 } else {
-                    fb[idx] = 0f; fb[idx + 1] = 0f; fb[idx + 2] = 0f
+                    // letterbox padding (Ultralytics default fill=114)
+                    fb[base] = 114f / 255f
+                    fb[plane + base] = 114f / 255f
+                    fb[2 * plane + base] = 114f / 255f
                 }
-                idx += 3
             }
         }
 
@@ -149,9 +164,12 @@ class YoloDetector(private val context: Context) {
         val anchors = 8400
         val numCls = 80
         val stride = anchors
-        val boxes = ArrayList<FloatArray>()
-        val scores = FloatArray(anchors)
-        val classes = IntArray(anchors)
+
+        // Candidate boxes are collected in one pass; the box list index is decoupled
+        // from the anchor index so NMS lookup never desyncs (previous bug: boxes[anchor]).
+        val boxes = ArrayList<FloatArray>(64)
+        val scores = ArrayList<Float>(64)
+        val classes = ArrayList<Int>(64)
 
         for (j in 0 until anchors) {
             val cx = raw[j]
@@ -165,24 +183,21 @@ class YoloDetector(private val context: Context) {
                 if (s > best) { best = s; bestC = c }
             }
             if (best < CONF_THRESHOLD) continue
-            scores[j] = best
-            classes[j] = bestC
-            val x1 = cx - bw / 2f
-            val y1 = cy - bh / 2f
-            val x2 = cx + bw / 2f
-            val y2 = cy + bh / 2f
-            boxes.add(floatArrayOf(x1, y1, x2, y2))
+            boxes.add(floatArrayOf(
+                cx - bw / 2f, cy - bh / 2f, cx + bw / 2f, cy + bh / 2f
+            ))
+            scores.add(best)
+            classes.add(bestC)
         }
         if (boxes.isEmpty()) return emptyList()
 
-        val idxs = (0 until anchors).filter { scores[it] >= CONF_THRESHOLD }
-        val keep = nms(idxs, boxes, scores)
-        val out = ArrayList<DetectedObject>()
-        for (anchor in keep) {
-            val b = boxes[anchor]
-            val lab = if (classes[anchor] in COCO_LABELS.indices) COCO_LABELS[classes[anchor]].lowercase() else "object"
+        val keep = nms(scores, boxes)
+        val out = ArrayList<DetectedObject>(keep.size)
+        for (i in keep) {
+            val b = boxes[i]
+            val lab = if (classes[i] in COCO_LABELS.indices) COCO_LABELS[classes[i]].lowercase() else "object"
             val rect = letterboxToBitmapRect(b[0], b[1], b[2], b[3], scale, padX, padY, w, h) ?: continue
-            out.add(DetectedObject(rect, lab, scores[anchor]))
+            out.add(DetectedObject(rect, lab, scores[i]))
         }
         return out
     }
@@ -204,12 +219,12 @@ class YoloDetector(private val context: Context) {
         return NormalizedRect(bx1 / w, by1 / h, bx2 / w, by2 / h)
     }
 
-    private fun nms(idxs: List<Int>, boxes: MutableList<FloatArray>, scores: FloatArray): List<Int> {
-        val sorted = idxs.sortedByDescending { scores[it] }
-        return simpleNms(sorted, boxes, scores)
+    private fun nms(scores: List<Float>, boxes: List<FloatArray>): List<Int> {
+        val sorted = scores.indices.sortedByDescending { scores[it] }
+        return simpleNms(sorted, boxes)
     }
 
-    private fun simpleNms(sorted: List<Int>, boxes: MutableList<FloatArray>, scores: FloatArray): List<Int> {
+    private fun simpleNms(sorted: List<Int>, boxes: List<FloatArray>): List<Int> {
         val keep = ArrayList<Int>()
         val used = BooleanArray(boxes.size)
         for (a in sorted) {
@@ -217,7 +232,7 @@ class YoloDetector(private val context: Context) {
             keep.add(a)
             for (b in sorted) {
                 if (used[b]) continue
-                if (iou(boxes[a], boxes[b]) > NMS_THRESHOLD) used[b] = true
+                if (a != b && iou(boxes[a], boxes[b]) > NMS_THRESHOLD) used[b] = true
             }
             used[a] = true
         }
