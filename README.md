@@ -2,7 +2,7 @@
 
 一款基于 Android + Jetpack Compose 的快递单号快速识别应用。通过相机实时扫描或静态图片识别，**锁定目标快递单号**，同时支持 AI 人像/人头计数与多种识别算法切换。
 
-> 本人使用，欢迎下载体验 · 最新 APK 见 [Releases](../../releases)
+> 本人使用，欢迎下载体验 · 最新 APK (v1.0.1) 见 [Releases](../../releases)
 
 ---
 
