@@ -17,4 +17,8 @@ local.properties
 Thumbs.db
 
 # Logs
-*.log极速找快递-v*.apk
+*.log
+
+# APK packages (hosted as GitHub Release assets, not in the repo)
+极速找快递-v*.apk
+*.apk
